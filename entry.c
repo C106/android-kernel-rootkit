@@ -11,6 +11,8 @@
 #include <linux/anon_inodes.h>
 #include <linux/task_work.h>
 #include <linux/vmalloc.h>
+#include <linux/rcupdate.h>
+#include <linux/sched/signal.h>
 #include <asm/unaligned.h>
 #include "debugger_uapi.h"
 #include "memory.h"
@@ -18,6 +20,7 @@
 #include "hw_breakpoint.h"
 #include "maps_filter.h"
 #include "ttbr_view.h"
+#include "memwatch.h"
 
 struct lk1337_legacy_snapshot {
 	struct pt_regs regs;
@@ -48,9 +51,11 @@ static bool lk1337_root(void)
 }
 
 
+/* Both bootstraps hand back the same session fd: memwatch is part of this
+ * module now and its MW_HIDE_* commands are dispatched by lk1337_dispatch(). */
 static bool lk1337_hook_command(unsigned int cmd)
 {
-	return cmd == LK1337_BOOTSTRAP;
+	return cmd == LK1337_BOOTSTRAP || cmd == MW_BOOTSTRAP;
 }
 
 struct lk1337_bootstrap_work {
@@ -72,12 +77,38 @@ static __nocfi int lk1337_add_task_work(struct task_struct *task,
 static const struct file_operations lk1337_fops;
 
 /* Optional sendto gyro stream transformer. Records are 0x68 bytes; type at
- * +8, two float bit-patterns at +24/+28. */
+ * +8, two float bit-patterns at +24/+28.
+ *
+ * Only sends issued by system_server are rewritten: the sensor service lives
+ * there, so filtering on the sender's thread-group id leaves every other
+ * process's sendto() completely untouched. The id is resolved when the
+ * feature is enabled, so a system_server restart needs a re-enable.
+ */
 /* Disabled until userspace supplies an explicit configuration via ioctl. */
 static atomic_t gyro_enabled = ATOMIC_INIT(0);
+static pid_t gyro_server_tgid;
 static u32 gyro_mask;
 static u32 gyro_add0, gyro_add1;
 static DEFINE_MUTEX(gyro_lock);
+
+/* system_server's thread-group id, or 0 when it is not running. */
+static pid_t lk1337_gyro_find_server(void)
+{
+	struct task_struct *task, *found = NULL;
+	pid_t tgid = 0;
+
+	rcu_read_lock();
+	for_each_process(task) {
+		if (!strcmp(task->comm, "system_server")) {
+			found = task;
+			break;
+		}
+	}
+	if (found)
+		tgid = task_tgid_vnr(found);
+	rcu_read_unlock();
+	return tgid;
+}
 
 /*
  * Add two IEEE-754 binary32 bit patterns without using floating point in
@@ -201,8 +232,12 @@ static int lk1337_gyro_pre(struct kprobe *kp, struct pt_regs *regs)
 	ubuf = (void __user *)(uintptr_t)sysregs->regs[1];
 	len = (size_t)sysregs->regs[2];
 
-	if (!atomic_read(&gyro_enabled) || !ubuf || !len || len > 0x200000 ||
-	    (len % 0x68))
+	/* Only system_server's sends are rewritten. Compared by thread group, so
+	 * any sensor thread inside system_server matches. */
+	if (!atomic_read(&gyro_enabled) || !READ_ONCE(gyro_server_tgid) ||
+	    task_tgid_vnr(current) != READ_ONCE(gyro_server_tgid))
+		return 0;
+	if (!ubuf || !len || len > 0x200000 || (len % 0x68))
 		return 0;
 	p = vmalloc(len);
 	if (!p)
@@ -301,6 +336,12 @@ static int lk1337_ioctl_hook(struct kprobe *probe, struct pt_regs *regs)
 
 	if (!lk1337_hook_command(cmd))
 		return 0;
+	/* memwatch reuses this hook and this workfn: its bootstrap struct is
+	 * layout-identical, so the fd lands in the caller's `fd` field either
+	 * way. */
+	BUILD_BUG_ON(sizeof(struct mw_bootstrap) != sizeof(struct lk1337_bootstrap));
+	BUILD_BUG_ON(offsetof(struct mw_bootstrap, fd) !=
+		     offsetof(struct lk1337_bootstrap, fd));
 	pr_info_ratelimited("inet_ioctl bootstrap cmd=%u uid=%u euid=%u pid=%d\n",
 			    cmd, __kuid_val(current_uid()), __kuid_val(current_euid()),
 			    task_pid_vnr(current));
@@ -405,14 +446,37 @@ static long lk1337_dispatch(struct lk1337_session *session, unsigned int cmd,
 	unsigned long flags;
 	int error, id;
 	size_t size;
+	/* memwatch commands are module-level state, not per-session. */
+	if (lk1337_memwatch_command(cmd))
+		return lk1337_memwatch_dispatch(cmd, arg);
 	error = lk1337_ttbr_dispatch(session, cmd, arg);
 	if (error != -ENOTTY)
 		return error;
 	if (cmd == LK1337_GYRO_CONFIG) {
-		if (copy_from_user(&request.gyro, arg, sizeof(request.gyro))) return -EFAULT;
-		mutex_lock(&gyro_lock); gyro_mask = request.gyro.type_mask;
-		gyro_add0 = request.gyro.add0; gyro_add1 = request.gyro.add1;
-		atomic_set(&gyro_enabled, request.gyro.enable != 0); mutex_unlock(&gyro_lock);
+		if (copy_from_user(&request.gyro, arg, sizeof(request.gyro)))
+			return -EFAULT;
+		if (request.gyro.enable) {
+			pid_t tgid = lk1337_gyro_find_server();
+
+			if (!tgid) {
+				pr_warn("gyro: system_server not found, not enabling\n");
+				return -ESRCH;
+			}
+			WRITE_ONCE(gyro_server_tgid, tgid);
+		}
+		mutex_lock(&gyro_lock);
+		gyro_mask = request.gyro.type_mask;
+		gyro_add0 = request.gyro.add0;
+		gyro_add1 = request.gyro.add1;
+		atomic_set(&gyro_enabled, request.gyro.enable != 0);
+		if (!request.gyro.enable)
+			WRITE_ONCE(gyro_server_tgid, 0);
+		mutex_unlock(&gyro_lock);
+		pr_info("gyro: %s mask=0x%x add0=0x%08x add1=0x%08x tgid=%d\n",
+			request.gyro.enable ? "enabled" : "disabled",
+			request.gyro.type_mask, request.gyro.add0,
+			request.gyro.add1,
+			request.gyro.enable ? gyro_server_tgid : 0);
 		return 0;
 	}
 	/* Maps filter commands */
@@ -614,12 +678,19 @@ static int __init lk1337_init(void)
 		pr_err("gyro kprobe registration failed: %d\n", error);
 		return error;
 	}
+	/* Process hiding is optional: a kernel without the procfs hooks still
+	 * gets the memory/breakpoint core. */
+	error = lk1337_memwatch_init();
+	if (error)
+		pr_warn("process hiding unavailable (%d), continuing without it\n",
+			error);
 	pr_info("loaded ABI=%d anonymous-fd bootstrap\n", LK1337_ABI_VERSION);
 	return 0;
 }
 
 static void __exit lk1337_exit(void)
 {
+	lk1337_memwatch_exit();
 	lk1337_ttbr_exit();
 	lk1337_maps_filter_exit();
 	unregister_kprobe(&lk1337_gyro_kp);
