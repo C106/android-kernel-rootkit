@@ -24,6 +24,26 @@
 #define LK1337_MAPS_FILTER_REMOVE_PID 626
 #define LK1337_MAPS_FILTER_CLEAR_PID 627
 #define LK1337_MAPS_FILTER_SET_ALL 628
+/*
+ * LK1337_TTBR_SETUP flags.
+ *
+ * The default split direction is: the executor thread sees the ALTER view and
+ * every other thread of the process keeps the original page table.  That is the
+ * useful direction for the common case -- impersonating one thread (an inline
+ * hook that only that thread runs) while the process at large is untouched.
+ *
+ * LK1337_TTBR_F_EXECUTOR_SOURCE selects the opposite mapping: the executor
+ * keeps the original view and every other thread sees the alter view (a sandbox
+ * that the process at large runs inside, with the controlling thread outside).
+ *
+ * There is deliberately no "executor alter" flag any more.  A caller compiled
+ * against the previous ABI would pass that bit expecting it to invert the
+ * default, and on a build where it is already the default the bit would be a
+ * silent no-op: it is rejected with -EINVAL instead.
+ */
+#define LK1337_TTBR_F_EXECUTOR_ALTER (1u << 0)	/* rejected: now the default */
+#define LK1337_TTBR_F_EXECUTOR_SOURCE (1u << 1)
+
 #define LK1337_TTBR_SETUP 630
 #define LK1337_TTBR_UPDATE 631
 #define LK1337_TTBR_SET_EXECUTOR 632
@@ -33,10 +53,18 @@
 #define LK1337_BT_MAX 32
 #define LK1337_BP_F_DETAIL  (1U << 0)
 #define LK1337_BP_F_BACKTRACE (1U << 1)
+/*
+ * Page-table (PTE UXN) backed execution breakpoint instead of a perf hardware
+ * breakpoint. type must be 0 (execute) and len 4; the PTE of the page holding
+ * addr is marked execute-never for EL0 and an instruction abort at exactly
+ * addr is reported as a hit. The trap is per-mm, so every thread of the target
+ * thread group triggers it.
+ */
+#define LK1337_BP_F_UXN       (1U << 2)
 #define LK1337_GYRO_MASK_GYRO (1u << 0)
 #define LK1337_GYRO_MASK_UNCAL (1u << 1)
 #define LK1337_GYRO_MASK_ALL (LK1337_GYRO_MASK_GYRO | LK1337_GYRO_MASK_UNCAL)
-#define LK1337_ABI_VERSION 3
+#define LK1337_ABI_VERSION 6
 #define LK1337_FP_VALID 1
 #define LK1337_FP_CHANGED 2
 #define LK1337_ONESHOT 1

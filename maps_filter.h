@@ -164,6 +164,7 @@ static int lk1337_filter_pid_count = 0;
 /* Global filtering is the default once maps hooks are enabled. */
 static bool lk1337_filter_all_pids = true;  /* true=全局过滤，false=仅过滤指定PID */
 static bool lk1337_maps_filter_enabled;
+static DEFINE_MUTEX(lk1337_maps_filter_lock);
 /* Raw spinlock: readers run inside kprobe pre_handlers, which may fire with
  * preemption or interrupts disabled (memwatch uses the same rule). */
 static DEFINE_RAW_SPINLOCK(lk1337_pid_lock);
@@ -651,13 +652,30 @@ static struct kprobe lk1337_map_files_readlink_kp = {
 	.pre_handler = lk1337_map_files_readlink_pre,
 };
 
+static void lk1337_maps_filter_unhook(void)
+{
+	WRITE_ONCE(lk1337_maps_filter_enabled, false);
+
+	/* Unregister every probe, including the optional map_files hooks. */
+	unregister_kprobe(&lk1337_show_map_kp);
+	unregister_kprobe(&lk1337_show_smap_kp);
+	unregister_kprobe(&lk1337_show_smaps_rollup_kp);
+	unregister_kprobe(&lk1337_map_files_link_kp);
+	unregister_kprobe(&lk1337_map_files_readlink_kp);
+	unregister_kprobe(&lk1337_map_files_lookup_kp);
+	unregister_kprobe(&lk1337_map_files_instantiate_kp);
+	unregister_kprobe(&lk1337_map_files_fill_cache_kp);
+}
+
 /* 初始化maps过滤 */
 static int lk1337_maps_filter_init(void)
 {
 	int error;
 	int hooks_registered = 0;
+
+	mutex_lock(&lk1337_maps_filter_lock);
 	if (lk1337_maps_filter_enabled)
-		return 0;
+		goto out_ok;
 
 	/*
 	 * Resolve kallsyms_on_each_symbol first: on CFI builds the static proc
@@ -735,14 +753,32 @@ static int lk1337_maps_filter_init(void)
 
 	if (hooks_registered == 0) {
 		pr_err("maps filter: no hooks registered, aborting\n");
-		return -ENOENT;
+		error = -ENOENT;
+		goto out;
 	}
-	lk1337_maps_filter_enabled = true;
+	WRITE_ONCE(lk1337_maps_filter_enabled, true);
 
 	pr_info("maps filter initialized, %d hooks active, %d built-in patterns\n",
 		hooks_registered,
 		(int)(sizeof(lk1337_hide_patterns) / sizeof(char *) - 1));
-	return 0;
+	error = 0;
+	goto out;
+
+out_ok:
+	error = 0;
+out:
+	mutex_unlock(&lk1337_maps_filter_lock);
+	return error;
+}
+
+/* Disable hooks while retaining configured patterns for a later enable. */
+static void lk1337_maps_filter_disable(void)
+{
+	mutex_lock(&lk1337_maps_filter_lock);
+	if (lk1337_maps_filter_enabled)
+		lk1337_maps_filter_unhook();
+	mutex_unlock(&lk1337_maps_filter_lock);
+	pr_info("maps filter disabled\n");
 }
 
 /* 清理maps过滤 */
@@ -751,17 +787,10 @@ static void lk1337_maps_filter_exit(void)
 	unsigned long flags;
 	int i;
 
-	lk1337_maps_filter_enabled = false;
-
-	/* 卸载所有kprobe */
-	unregister_kprobe(&lk1337_show_map_kp);
-	unregister_kprobe(&lk1337_show_smap_kp);
-	unregister_kprobe(&lk1337_show_smaps_rollup_kp);
-	unregister_kprobe(&lk1337_map_files_link_kp);
-	unregister_kprobe(&lk1337_map_files_readlink_kp);
-	unregister_kprobe(&lk1337_map_files_lookup_kp);
-	unregister_kprobe(&lk1337_map_files_instantiate_kp);
-	unregister_kprobe(&lk1337_map_files_fill_cache_kp);
+	mutex_lock(&lk1337_maps_filter_lock);
+	if (lk1337_maps_filter_enabled)
+		lk1337_maps_filter_unhook();
+	mutex_unlock(&lk1337_maps_filter_lock);
 
 	/* 释放自定义规则 */
 	raw_spin_lock_irqsave(&lk1337_pattern_lock, flags);

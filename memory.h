@@ -155,8 +155,18 @@ static struct page *lk1337_resolve_page(struct mm_struct *mm, unsigned long addr
 	 * KSM page is ordinary anonymous data. Device mappings stay excluded via
 	 * pte_devmap() plus pfn_valid().
 	 */
+	/*
+	 * Write permission must not be tested with pte_write() alone.  On arm64
+	 * PTE_WRITE *is* PTE_DBM (bit 51): a private writable page only carries
+	 * it when hardware access/dirty management happens to have set it, and
+	 * otherwise expresses writability through AP[2] being clear.  Testing
+	 * pte_write() therefore rejects exactly the mappings a debugger needs
+	 * most -- .bss, .data, the heap and JIT pages -- while shared mappings
+	 * (PAGE_SHARED sets PTE_WRITE explicitly) pass.  Accept either encoding.
+	 */
 	if (pte_present(entry) && !pte_protnone(entry) && !pte_devmap(entry) &&
-	    (!write || pte_write(entry)) && pfn_valid(pte_pfn(entry))) {
+	    (!write || pte_write(entry) ||
+	     !(pte_val(entry) & PTE_RDONLY)) && pfn_valid(pte_pfn(entry))) {
 		page = pfn_to_page(pte_pfn(entry));
 		get_page(page);
 	} else if (!write && is_swap_pte(entry)) {
@@ -197,6 +207,8 @@ static int lk1337_memory_transfer(struct lk1337_memory *request, bool write,
 	if (!remaining)
 		return 0;
 	target = find_get_pid(request->pid);
+	if (!target)
+		return -ESRCH;
 	task = get_pid_task(target, PIDTYPE_PID);
 	put_pid(target);
 	if (!task)

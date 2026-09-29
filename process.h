@@ -18,6 +18,10 @@ static int lk1337_module_base(struct lk1337_base *request)
 	if (IS_ERR(name))
 		return PTR_ERR(name);
 	target = find_get_pid(request->pid);
+	if (!target) {
+		kfree(name);
+		return -ESRCH;
+	}
 	task = get_pid_task(target, PIDTYPE_PID);
 	put_pid(target);
 	if (!task) {

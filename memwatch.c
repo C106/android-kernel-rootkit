@@ -16,6 +16,7 @@
 #include <linux/dcache.h>
 #include "memwatch_uapi.h"
 #include "memwatch.h"
+#include "probe_mgr.h"
 
 /* Hidden thread-group id list. Module level: every anonymous fd shares it. */
 static pid_t mw_hidden_pids[MW_MAX_HIDDEN];
@@ -106,10 +107,8 @@ static int mw_proc_fill_cache_pre(struct kprobe *p, struct pt_regs *regs)
 	return 1;
 }
 
-static struct kprobe mw_proc_fill_cache_kp = {
-	.symbol_name = "proc_fill_cache",
-	.pre_handler = mw_proc_fill_cache_pre,
-};
+static struct lk1337_probe mw_proc_fill_cache_probe =
+	LK1337_PROBE("proc_fill_cache", "memwatch", mw_proc_fill_cache_pre, NULL);
 
 /*
  * Direct /proc/<pid> lookup. In this tree the signature is
@@ -140,10 +139,8 @@ static int mw_proc_pid_lookup_pre(struct kprobe *p, struct pt_regs *regs)
 	return 1;
 }
 
-static struct kprobe mw_proc_pid_lookup_kp = {
-	.symbol_name = "proc_pid_lookup",
-	.pre_handler = mw_proc_pid_lookup_pre,
-};
+static struct lk1337_probe mw_proc_pid_lookup_probe =
+	LK1337_PROBE("proc_pid_lookup", "memwatch", mw_proc_pid_lookup_pre, NULL);
 
 /*
  * Signals addressed at a hidden pid: report success and drop the delivery.
@@ -169,69 +166,64 @@ static int mw_do_send_sig_info_pre(struct kprobe *p, struct pt_regs *regs)
 	return 1;
 }
 
-static struct kprobe mw_do_send_sig_info_kp = {
-	.symbol_name = "do_send_sig_info",
-	.pre_handler = mw_do_send_sig_info_pre,
-};
+static struct lk1337_probe mw_do_send_sig_info_probe =
+	LK1337_PROBE("do_send_sig_info", "memwatch", mw_do_send_sig_info_pre, NULL);
 
 static bool mw_fill_cache_hooked;
 static bool mw_pid_lookup_hooked;
 static bool mw_send_sig_hooked;
 
 /*
- * All three hooks are optional here: lk1337 is the core debugger and must not
- * fail to load because process hiding is unavailable on this kernel. A hook
- * that does not register simply drops its flag from mw_caps, so MW_HIDE_QUERY
- * reports only what is actually in effect.
+ * The procfs hooks are installed the first time hiding is actually configured
+ * (MW_HIDE_ADD / MW_HIDE_ENABLE), not at module load.  Process hiding is inert
+ * until a pid is listed *and* the feature is enabled, so a dormant module has
+ * no business holding three probes in procfs.  Once armed they stay armed:
+ * hiding is by definition an actively-used feature from that point on.
+ *
+ * Each hook is optional.  A hook that does not register simply drops its flag
+ * from mw_caps, so MW_HIDE_QUERY reports only what is actually in effect.
  */
-static int mw_hooks_init(void)
+static int mw_hooks_arm(void)
 {
-	int error;
-
-	mw_caps = MW_F_HIDE_ROOT;
-
-	error = register_kprobe(&mw_proc_fill_cache_kp);
-	if (error) {
-		pr_warn("proc_fill_cache hook unavailable (%d), /proc enumeration hiding inactive\n",
-			error);
-	} else {
-		mw_fill_cache_hooked = true;
-		mw_caps |= MW_F_PROC_LIST;
+	if (!mw_fill_cache_hooked) {
+		if (lk1337_probe_use(&mw_proc_fill_cache_probe))
+			pr_warn("proc_fill_cache hook unavailable, /proc enumeration hiding inactive\n");
+		else {
+			mw_fill_cache_hooked = true;
+			mw_caps |= MW_F_PROC_LIST;
+		}
 	}
-
-	error = register_kprobe(&mw_proc_pid_lookup_kp);
-	if (error) {
-		pr_warn("proc_pid_lookup hook unavailable (%d), /proc/<pid> hiding inactive\n",
-			error);
-	} else {
-		mw_pid_lookup_hooked = true;
-		mw_caps |= MW_F_PROC_LOOKUP;
+	if (!mw_pid_lookup_hooked) {
+		if (lk1337_probe_use(&mw_proc_pid_lookup_probe))
+			pr_warn("proc_pid_lookup hook unavailable, /proc/<pid> hiding inactive\n");
+		else {
+			mw_pid_lookup_hooked = true;
+			mw_caps |= MW_F_PROC_LOOKUP;
+		}
 	}
-
-	error = register_kprobe(&mw_do_send_sig_info_kp);
-	if (error)
-		pr_warn("do_send_sig_info hook unavailable (%d), signal hiding inactive\n",
-			error);
-	else {
-		mw_send_sig_hooked = true;
-		mw_caps |= MW_F_SIGNAL;
+	if (!mw_send_sig_hooked) {
+		if (lk1337_probe_use(&mw_do_send_sig_info_probe))
+			pr_warn("do_send_sig_info hook unavailable, signal hiding inactive\n");
+		else {
+			mw_send_sig_hooked = true;
+			mw_caps |= MW_F_SIGNAL;
+		}
 	}
-
 	return mw_caps == MW_F_HIDE_ROOT ? -ENOENT : 0;
 }
 
 static void mw_hooks_exit(void)
 {
 	if (mw_send_sig_hooked) {
-		unregister_kprobe(&mw_do_send_sig_info_kp);
+		lk1337_probe_release(&mw_do_send_sig_info_probe);
 		mw_send_sig_hooked = false;
 	}
 	if (mw_pid_lookup_hooked) {
-		unregister_kprobe(&mw_proc_pid_lookup_kp);
+		lk1337_probe_release(&mw_proc_pid_lookup_probe);
 		mw_pid_lookup_hooked = false;
 	}
 	if (mw_fill_cache_hooked) {
-		unregister_kprobe(&mw_proc_fill_cache_kp);
+		lk1337_probe_release(&mw_proc_fill_cache_probe);
 		mw_fill_cache_hooked = false;
 	}
 }
@@ -330,6 +322,8 @@ long lk1337_memwatch_dispatch(unsigned int cmd, void __user *arg)
 
 	switch (cmd) {
 	case MW_HIDE_ADD:
+		if (mw_hooks_arm())
+			return -ENOENT;
 		if (copy_from_user(&request, arg, sizeof(request)))
 			return -EFAULT;
 		/* pid 0 means the caller's own thread group. */
@@ -348,6 +342,10 @@ long lk1337_memwatch_dispatch(unsigned int cmd, void __user *arg)
 		if (enable.flags & ~(MW_F_PROC_LIST | MW_F_PROC_LOOKUP |
 				     MW_F_SIGNAL | MW_F_HIDE_ROOT))
 			return -EINVAL;
+		/* Install the hooks *before* reading mw_caps: the flags the
+		 * caller asked for can only be honoured if the hook exists. */
+		if (enable.enable && mw_hooks_arm())
+			return -ENOENT;
 		/* Features whose hook is missing are dropped, not silently
 		 * reported as active. */
 		flags = enable.flags & mw_caps;
@@ -369,12 +367,14 @@ long lk1337_memwatch_dispatch(unsigned int cmd, void __user *arg)
 
 int lk1337_memwatch_init(void)
 {
-	int error = mw_hooks_init();
-
-	if (error)
-		return error;
-	pr_info("process hiding ready (abi=%d caps=0x%x)\n",
-		MW_ABI_VERSION, mw_caps);
+	mw_caps = MW_F_HIDE_ROOT;
+	/*
+	 * Nothing is hooked yet.  mw_hooks_arm() installs the procfs/signal
+	 * probes the first time hiding is configured, so a module that never
+	 * uses this feature does not hold a procfs probe.
+	 */
+	pr_info("process hiding ready (abi=%d, hooks installed on first use)\n",
+		MW_ABI_VERSION);
 	return 0;
 }
 

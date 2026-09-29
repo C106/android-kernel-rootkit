@@ -6,6 +6,13 @@
 #include <linux/vmalloc.h>
 #include "fpsimd_state.h"
 
+/*
+ * Page-table (PTE UXN) execution-breakpoint backend, implemented in
+ * uxn_breakpoint.h. Declared here because creating and destroying a
+ * breakpoint is routed through it.
+ */
+struct lk1337_uxn_ref;
+
 struct lk1337_breakpoint {
 	struct list_head node;
 	struct perf_event *event;
@@ -20,6 +27,10 @@ struct lk1337_breakpoint {
 	unsigned int count;
 	int id;
 	u32 flags;
+	/* Set for LK1337_BP_F_UXN: no perf event, the trap lives in the page
+	 * table and uxn_ref links this breakpoint into the global UXN page. */
+	bool uxn;
+	struct lk1337_uxn_ref *uxn_ref;
 };
 
 struct lk1337_session {
@@ -30,6 +41,12 @@ struct lk1337_session {
 	int next_id;
 };
 
+/* UXN backend entry points, defined in uxn_breakpoint.h further down. */
+static int lk1337_uxn_create_bp(struct lk1337_session *session,
+				struct lk1337_create *request);
+static void lk1337_uxn_destroy_bp(struct lk1337_breakpoint *bp);
+static int lk1337_uxn_set_enabled(struct lk1337_breakpoint *bp, bool enable);
+
 static void lk1337_capture_user_bt(struct lk1337_hit *hit, struct pt_regs *regs)
 {
 	u64 fp = regs->regs[29], frame[2];
@@ -38,7 +55,12 @@ static void lk1337_capture_user_bt(struct lk1337_hit *hit, struct pt_regs *regs)
 	if (regs->regs[30] < TASK_SIZE_64 && n < LK1337_BT_MAX)
 		hit->backtrace[n++] = regs->regs[30] - 4;
 	while (n < LK1337_BT_MAX && fp && !(fp & 15) && fp < TASK_SIZE_64 - 16) {
-		if (copy_from_user(frame, (void __user *)(uintptr_t)fp, sizeof(frame))) {
+		/* Perf debug exceptions run with preemption disabled.  Do not allow a
+		 * user-stack page fault here; an inatomic copy records a truncated
+		 * backtrace instead of sleeping while bp->lock is held. */
+		if (__copy_from_user_inatomic(frame,
+					      (void __user *)(uintptr_t)fp,
+					      sizeof(frame))) {
 			hit->bt_flags |= 1; break;
 		}
 		if (!frame[0] || frame[0] <= fp || (frame[0] & 15) || frame[0] >= TASK_SIZE_64) break;
@@ -57,10 +79,16 @@ static void lk1337_snapshot_gp(struct lk1337_snapshot *snapshot, struct pt_regs 
 	snapshot->pstate = regs->pstate;
 }
 
-static void lk1337_overflow(struct perf_event *event, struct perf_sample_data *data,
-		       struct pt_regs *regs)
+/*
+ * Handle one breakpoint hit: bump the counters, optionally record a detailed
+ * ring entry (with backtrace and FPSIMD state), and apply the register
+ * template. Shared by the perf (hardware) backend and the page-table (UXN)
+ * backend, so both expose identical LK1337_BP_HITS/LK1337_BP_TEMPLATE
+ * semantics. @trigger is the address the hit is reported at.
+ */
+static void lk1337_handle_hit(struct lk1337_breakpoint *bp, struct pt_regs *regs,
+			      unsigned long trigger)
 {
-	struct lk1337_breakpoint *bp = event->overflow_handler_context;
 	struct lk1337_template *change = &bp->change;
 	struct lk1337_hit *hit;
 	unsigned long flags;
@@ -93,7 +121,7 @@ static void lk1337_overflow(struct perf_event *event, struct perf_sample_data *d
 	memset(hit, 0, sizeof(*hit));
 	hit->sequence = ++bp->total;
 	hit->timestamp = ktime_get_ns();
-	hit->addr = counter_arch_bp(event)->trigger;
+	hit->addr = trigger;
 	hit->pid = task_tgid_vnr(current);
 	hit->tid = task_pid_vnr(current);
 	if (bp->flags & LK1337_BP_F_BACKTRACE)
@@ -140,6 +168,14 @@ static void lk1337_overflow(struct perf_event *event, struct perf_sample_data *d
 	raw_spin_unlock_irqrestore(&bp->lock, flags);
 }
 
+static void lk1337_overflow(struct perf_event *event, struct perf_sample_data *data,
+		       struct pt_regs *regs)
+{
+	struct lk1337_breakpoint *bp = event->overflow_handler_context;
+
+	lk1337_handle_hit(bp, regs, counter_arch_bp(event)->trigger);
+}
+
 static struct lk1337_breakpoint *lk1337_find(struct lk1337_session *session, int id)
 {
 	struct lk1337_breakpoint *bp;
@@ -161,6 +197,9 @@ static int lk1337_create_bp(struct lk1337_session *session, struct lk1337_create
 		HW_BREAKPOINT_X, HW_BREAKPOINT_R, HW_BREAKPOINT_W, HW_BREAKPOINT_RW
 	};
 
+	/* Page-table backed execution breakpoints have their own backend. */
+	if (request->flags & LK1337_BP_F_UXN)
+		return lk1337_uxn_create_bp(session, request);
 	if (request->type < 0 || request->type > 3 || request->pid < 0 ||
 	    (request->flags & ~(LK1337_BP_F_DETAIL | LK1337_BP_F_BACKTRACE)) ||
 	    ((request->flags & LK1337_BP_F_BACKTRACE) && !(request->flags & LK1337_BP_F_DETAIL)) ||
@@ -238,9 +277,30 @@ fail:
 static void lk1337_destroy_bp(struct lk1337_breakpoint *bp)
 {
 	list_del(&bp->node);
-	perf_event_release_kernel(bp->event);
+	if (bp->uxn)
+		lk1337_uxn_destroy_bp(bp);
+	else
+		perf_event_release_kernel(bp->event);
 	kvfree(bp->ring);
 	kfree(bp);
+}
+
+/* Pause/resume independent of the backend: a UXN breakpoint leaves its
+ * execute-never bit in the page table, a perf breakpoint toggles its event. */
+static int lk1337_bp_pause(struct lk1337_breakpoint *bp)
+{
+	if (bp->uxn)
+		return lk1337_uxn_set_enabled(bp, false);
+	perf_event_disable(bp->event);
+	return 0;
+}
+
+static int lk1337_bp_resume(struct lk1337_breakpoint *bp)
+{
+	if (bp->uxn)
+		return lk1337_uxn_set_enabled(bp, true);
+	perf_event_enable(bp->event);
+	return 0;
 }
 
 static int lk1337_set_template(struct lk1337_breakpoint *bp, struct lk1337_template *change)

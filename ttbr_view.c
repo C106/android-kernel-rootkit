@@ -15,12 +15,15 @@
 #include <linux/uaccess.h>
 #include <linux/wait.h>
 #include <asm/cacheflush.h>
+#include <asm/mmu.h>
 #include <asm/mmu_context.h>
 #include <asm/pgalloc.h>
 #include <asm/pgtable.h>
+#include <asm/sysreg.h>
 #include <asm/tlbflush.h>
 
 #include "debugger_uapi.h"
+#include "probe_mgr.h"
 #include "ttbr_view.h"
 
 struct lk1337_session {
@@ -31,43 +34,62 @@ struct lk1337_session {
 	int next_id;
 };
 
-typedef struct mm_struct *(*ttbr_dup_mm_t)(struct task_struct *,
-							struct mm_struct *);
-typedef struct mm_struct *(*ttbr_mm_alloc_t)(void);
-typedef int (*ttbr_dup_mmap_t)(struct mm_struct *, struct mm_struct *);
 typedef unsigned long (*ttbr_kallsyms_lookup_name_t)(const char *);
-typedef void (*ttbr_check_context_t)(struct mm_struct *);
 typedef pte_t *(*ttbr_get_locked_pte_t)(struct mm_struct *, unsigned long,
 							spinlock_t **);
 
-static ttbr_dup_mm_t ttbr_dup_mm;
-static ttbr_mm_alloc_t ttbr_mm_alloc;
-static ttbr_dup_mmap_t ttbr_dup_mmap;
 static ttbr_kallsyms_lookup_name_t ttbr_kallsyms_lookup_name;
-static ttbr_check_context_t ttbr_check_context;
 static ttbr_get_locked_pte_t ttbr_get_locked_pte;
 static DEFINE_MUTEX(ttbr_global_lock);
 static DEFINE_RAW_SPINLOCK(ttbr_split_lock);
 static LIST_HEAD(ttbr_splits);
+/*
+ * The per-context-switch path needs to find the split for current->mm, and it
+ * runs inside a kprobe post-handler with the runqueue lock held.  Scanning the
+ * list under a global raw spinlock there meant every context switch on every
+ * CPU serialised on one lock -- on an 8-core device under scheduler churn that
+ * is millions of acquisitions per second per CPU, which is what wedged the box.
+ *
+ * Instead the hot path is lock-free: it reads this single pointer, which is
+ * only ever set or cleared in process context (setup and teardown), and at most
+ * one split exists per mm anyway.  Teardown waits for an RCU grace period
+ * before freeing, so a reader can never dereference a freed split.
+ *
+ * Instrumentation of this path under scheduler churn measured ~17 million
+ * post-handler invocations on a single CPU, each previously serialised on the
+ * global lock while the runqueue lock was held.  That contention is worth
+ * removing on its own; it is not proven to be the cause of the watchdog resets
+ * seen while stress-testing view splits (see bench/ab_baseline.txt and
+ * bench/ab_lockfree.txt -- both builds survived the same runs).
+ */
+static struct lk1337_ttbr_split __rcu *ttbr_active_split;
 static atomic_t ttbr_next_id = ATOMIC_INIT(1);
-static struct kprobe ttbr_exit_kp;
-static struct kprobe ttbr_exec_kp;
-static struct kprobe ttbr_switch_kp;
-static bool ttbr_exit_registered;
-static bool ttbr_exec_registered;
-static bool ttbr_switch_registered;
 
 struct lk1337_ttbr_split {
 	struct list_head session_node;
 	struct list_head global_node;
 	struct mm_struct *source_mm;
-	struct mm_struct *alter_mm;
+	/*
+	 * The alter view is a private pgd whose entries share the source mm's
+	 * page-table pages, except for a private pmd+pte chain covering the
+	 * target range.
+	 */
+	pgd_t *alter_pgd;
+	pmd_t *alter_pmd;
+	pte_t *alter_pte;
+	unsigned int target_pgd_index;
+	unsigned int target_pmd_index;
 	struct page **real_pages;
 	struct page **alter_pages;
 	phys_addr_t *real_phys;
 	phys_addr_t *alter_phys;
 	unsigned long start;
 	unsigned long end;
+	/*
+	 * True when the executor sees the alter view (the default) and every
+	 * other thread sees the source view.
+	 */
+	bool executor_alter;
 	unsigned int nr_pages;
 	pid_t source_pid;
 	pid_t executor_tid;
@@ -78,31 +100,16 @@ struct lk1337_ttbr_split {
 	int id;
 };
 
-static DEFINE_PER_CPU(struct lk1337_ttbr_split *, ttbr_active_split);
+/*
+ * Which page table this feature installed last on each CPU, keyed by the
+ * physical address of the pgd. Both views are walked with the *same* ASID (the
+ * source mm's), so a view change on a CPU has to drop that CPU's translations
+ * for the ASID; tracking the installed pgd lets us skip the flush when the
+ * view did not actually change.
+ */
+static DEFINE_PER_CPU(unsigned long, ttbr_active_pgd);
 
-static __nocfi struct mm_struct *ttbr_call_dup_mm(struct task_struct *task,
-							  struct mm_struct *source)
-{
-	return ttbr_dup_mm(task, source);
-}
-
-static __nocfi struct mm_struct *ttbr_call_mm_alloc(void)
-{
-	return ttbr_mm_alloc();
-}
-
-static __nocfi int ttbr_call_dup_mmap(struct mm_struct *mm,
-						struct mm_struct *source)
-{
-	return ttbr_dup_mmap(mm, source);
-}
-
-static __nocfi void ttbr_call_check_context(struct mm_struct *mm)
-{
-	ttbr_check_context(mm);
-}
-
-static __nocfi pte_t *ttbr_call_get_locked_pte(struct mm_struct *mm,
+static __nocfi __maybe_unused pte_t *ttbr_call_get_locked_pte(struct mm_struct *mm,
 							unsigned long addr,
 							spinlock_t **ptl)
 {
@@ -148,29 +155,6 @@ static int ttbr_resolve(void *storage, const char *name)
 	return 0;
 }
 
-static struct mm_struct *ttbr_clone_mm(struct task_struct *task,
-					       struct mm_struct *source)
-{
-	struct mm_struct *mm;
-	int ret;
-
-	if (ttbr_dup_mm)
-		return ttbr_call_dup_mm(task, source);
-	if (!ttbr_mm_alloc || !ttbr_dup_mmap)
-		return NULL;
-	mm = ttbr_call_mm_alloc();
-	if (!mm)
-		return NULL;
-	ret = ttbr_call_dup_mmap(mm, source);
-	if (ret) {
-		mmput(mm);
-		return NULL;
-	}
-	mm->hiwater_rss = get_mm_rss(mm);
-	mm->hiwater_vm = mm->total_vm;
-	return mm;
-}
-
 static void ttbr_resolve_kallsyms(void)
 {
 	struct kprobe probe = { .symbol_name = "kallsyms_lookup_name" };
@@ -202,7 +186,11 @@ static bool ttbr_valid_range(unsigned long start, unsigned long end,
 	    start >= TASK_SIZE_64 || end > TASK_SIZE_64)
 		return false;
 	size = end - start;
-	if (size > SZ_64M || (size >> PAGE_SHIFT) > UINT_MAX)
+	/* The alternate view has one private PMD/PTE chain.  Do not accept a
+	 * range that crosses the 2 MiB PMD containing @start; the old 64 MiB
+	 * limit silently wrapped pte_index() and installed the wrong pages. */
+	if (size > PMD_SIZE || (start & PMD_MASK) != ((end - 1) & PMD_MASK) ||
+	    (size >> PAGE_SHIFT) > UINT_MAX)
 		return false;
 	*nr_pages = size >> PAGE_SHIFT;
 	return *nr_pages != 0;
@@ -217,7 +205,7 @@ static int ttbr_pin_real_page(struct page *page)
 }
 
 static int ttbr_lookup_source_page(struct mm_struct *mm, unsigned long addr,
-					   struct page **result)
+						   struct page **result)
 {
 	pgd_t *pgd;
 	p4d_t *p4d;
@@ -230,7 +218,7 @@ static int ttbr_lookup_source_page(struct mm_struct *mm, unsigned long addr,
 	struct page *page = NULL;
 	int error = -EFAULT;
 
-	mmap_read_lock(mm);
+	/* Caller holds mmap_read_lock(mm) across the complete source-table walk. */
 	pgd = pgd_offset(mm, addr);
 	if (pgd_none(READ_ONCE(*pgd)) || pgd_bad(READ_ONCE(*pgd)))
 		goto out;
@@ -268,7 +256,6 @@ page_out:
 	else
 		page = NULL;
 out:
-	mmap_read_unlock(mm);
 	return page ? 0 : error;
 }
 
@@ -306,99 +293,235 @@ static int ttbr_alloc_alter_pages(struct page **pages, unsigned int count,
 	return 0;
 }
 
-static int ttbr_prepare_ptes(struct mm_struct *mm, unsigned long start,
-				     unsigned int count)
+/*
+ * Build the alter view: a private pgd that SHARES every page-table page of the
+ * source mm except for a private pmd+pte chain covering the target range.
+ *
+ * Sharing is what makes the whole thing work. A fault taken while running the
+ * alter view is still handled against current->mm, which stays the source mm,
+ * so the fix-up is written into the source's page tables; if the alter view
+ * had private copies of them (the dup_mm()/dup_mmap() snapshot the first
+ * implementation used) the hardware would keep faulting on the stale copy
+ * forever -- e.g. the first write to a COW thread stack. Sharing also means
+ * memory mapped after setup is automatically visible in both views.
+ *
+ * Only PTE-mapped target ranges are supported: a block (2 MB) PMD would have to
+ * be split to override a single page.
+ */
+static int ttbr_build_alter_tables(struct lk1337_ttbr_split *split)
 {
+	struct mm_struct *src = split->source_mm;
+	unsigned long start = split->start;
+	pgd_t *spgd = pgd_offset(src, start);
+	pud_t *spud;
+	pmd_t *spmd;
+	pmd_t *spmd_base;
+	pte_t *spte_base;
 	unsigned int i;
-	spinlock_t *ptl;
-	pte_t *ptep;
 
-	mmap_write_lock(mm);
-	for (i = 0; i < count; ++i) {
-		ptep = ttbr_call_get_locked_pte(mm, start + ((unsigned long)i << PAGE_SHIFT),
-					   &ptl);
-		if (!ptep) {
-			mmap_write_unlock(mm);
-			return -ENOMEM;
-		}
-		pte_unmap_unlock(ptep, ptl);
+	if (pgd_none(*spgd) || pgd_bad(*spgd))
+		return -EFAULT;
+	spud = pud_offset(p4d_offset(spgd, start), start);
+	if (pud_none(*spud) || pud_bad(*spud) || pud_sect(*spud))
+		return -EOPNOTSUPP;
+	spmd = pmd_offset(spud, start);
+	if (pmd_none(*spmd) || pmd_bad(*spmd) || pmd_sect(*spmd) ||
+	    pmd_trans_huge(*spmd))
+		return -EOPNOTSUPP;
+
+	split->alter_pgd = (pgd_t *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
+	split->alter_pmd = (pmd_t *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
+	split->alter_pte = (pte_t *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
+	if (!split->alter_pgd || !split->alter_pmd || !split->alter_pte)
+		return -ENOMEM;
+	if (!pgtable_pmd_page_ctor(virt_to_page(split->alter_pmd)) ||
+	    !pgtable_pte_page_ctor(virt_to_page(split->alter_pte)))
+		return -ENOMEM;
+
+	memcpy(split->alter_pgd, src->pgd, PAGE_SIZE);
+	spmd_base = (pmd_t *)__va(pgd_val(*spgd) & PAGE_MASK);
+	spte_base = (pte_t *)__va(pmd_val(*spmd) & PAGE_MASK);
+	memcpy(split->alter_pmd, spmd_base, PAGE_SIZE);
+	memcpy(split->alter_pte, spte_base, PAGE_SIZE);
+
+	split->target_pgd_index = pgd_index(start);
+	split->target_pmd_index = pmd_index(start);
+	split->alter_pmd[split->target_pmd_index] =
+		__pmd(__pa(split->alter_pte) | PMD_TYPE_TABLE);
+	split->alter_pgd[split->target_pgd_index] =
+		__pgd(__pa(split->alter_pmd) | PUD_TYPE_TABLE);
+
+	for (i = 0; i < split->nr_pages; ++i) {
+		unsigned long addr = start + ((unsigned long)i << PAGE_SHIFT);
+
+		split->alter_pte[pte_index(addr)] =
+			pfn_pte(page_to_pfn(split->alter_pages[i]), PAGE_READONLY);
 	}
-	mmap_write_unlock(mm);
+	dsb(ishst);
+	pr_info("ttbr: alter pgd=%px (share pgd[%u], private pmd[%u])\n",
+		split->alter_pgd, split->target_pgd_index,
+		split->target_pmd_index);
 	return 0;
 }
 
+static void ttbr_free_alter_tables(struct lk1337_ttbr_split *split)
+{
+	if (split->alter_pte) {
+		pgtable_pte_page_dtor(virt_to_page(split->alter_pte));
+		free_page((unsigned long)split->alter_pte);
+		split->alter_pte = NULL;
+	}
+	if (split->alter_pmd) {
+		pgtable_pmd_page_dtor(virt_to_page(split->alter_pmd));
+		free_page((unsigned long)split->alter_pmd);
+		split->alter_pmd = NULL;
+	}
+	if (split->alter_pgd) {
+		free_page((unsigned long)split->alter_pgd);
+		split->alter_pgd = NULL;
+	}
+}
+
+/* Repoint the target range at @pages (used by LK1337_TTBR_UPDATE). */
 static void ttbr_set_alter_ptes(struct lk1337_ttbr_split *split,
-					struct page **pages)
+				struct page **pages)
 {
 	unsigned int i;
-	spinlock_t *ptl;
-	pte_t *ptep;
 
-	mmap_write_lock(split->alter_mm);
 	for (i = 0; i < split->nr_pages; ++i) {
-		ptep = ttbr_call_get_locked_pte(split->alter_mm,
-					   split->start + ((unsigned long)i << PAGE_SHIFT), &ptl);
-		if (!ptep)
-			continue;
-		set_pte_at(split->alter_mm,
-			   split->start + ((unsigned long)i << PAGE_SHIFT), ptep,
-			   pfn_pte(page_to_pfn(pages[i]), PAGE_READONLY));
-		pte_unmap_unlock(ptep, ptl);
+		unsigned long addr = split->start + ((unsigned long)i << PAGE_SHIFT);
+
+		set_pte(&split->alter_pte[pte_index(addr)],
+			pfn_pte(page_to_pfn(pages[i]), PAGE_READONLY));
 	}
-	mmap_write_unlock(split->alter_mm);
+	dsb(ishst);
 }
 
-static void ttbr_clear_alter_ptes(struct lk1337_ttbr_split *split)
+/*
+ * Invalidate the source mm's ASID on this CPU only.
+ *
+ * The two views are distinguished purely by the page table in TTBR0 while the
+ * ASID stays the source mm's, so an entry cached while running one view is
+ * indistinguishable from an entry of the other and must not be reused.
+ */
+static void ttbr_flush_local_asid(struct mm_struct *mm)
 {
-	unsigned int i;
-	spinlock_t *ptl;
-	pte_t *ptep;
-	pte_t entry;
+	unsigned long asid = __TLBI_VADDR(0, ASID(mm));
 
-	mmap_write_lock(split->alter_mm);
-	for (i = 0; i < split->nr_pages; ++i) {
-		ptep = ttbr_call_get_locked_pte(split->alter_mm,
-					   split->start + ((unsigned long)i << PAGE_SHIFT), &ptl);
-		if (!ptep)
-			continue;
-		entry = READ_ONCE(*ptep);
-		if (pte_present(entry) && pte_pfn(entry) == page_to_pfn(split->alter_pages[i]))
-			pte_clear(split->alter_mm,
-				  split->start + ((unsigned long)i << PAGE_SHIFT), ptep);
-		pte_unmap_unlock(ptep, ptl);
-	}
-	mmap_write_unlock(split->alter_mm);
-}
-
-static void ttbr_sync_mm(struct mm_struct *mm)
-{
-	flush_tlb_mm(mm);
+	dsb(ishst);
+	__tlbi(aside1, asid);
+	__tlbi_user(aside1, asid);
 	dsb(ish);
+}
+
+static void ttbr_flush_asid_cb(void *info)
+{
+	ttbr_flush_local_asid(info);
+}
+
+/* Every CPU may have cached the ASID, so re-syncing after the alter PTEs
+ * change has to run everywhere. */
+static void ttbr_sync_mm(struct lk1337_ttbr_split *split)
+{
+	on_each_cpu(ttbr_flush_asid_cb, split->source_mm, 1);
+}
+
+/*
+ * Record @view_mm's page table as the current task's TTBR0, or the mm's own one
+ * when @view_mm is NULL (the executor). The ASID is always taken from
+ * @source_mm: it is the source mm that the kernel tracks, and TTBR1_EL1 (which
+ * TCR.A1 makes authoritative) still carries it.
+ */
+/*
+ * Point the current CPU at @view_mm's page table.
+ *
+ * TTBR0_EL1 is programmed here rather than through check_and_switch_context():
+ * the ASID is left exactly as the kernel chose for @source_mm (TTBR1_EL1 keeps
+ * it, and TCR.A1 makes that copy authoritative), only the translation base
+ * changes, so no ASID allocation or locking is involved and this is safe to do
+ * from finish_task_switch() with the runqueue lock held.
+ *
+ * The hardware register is written unconditionally. That is required on CPUs
+ * with hardware PAN, where the kernel programs TTBR0 in cpu_do_switch_mm() and
+ * never reloads it on the way out -- the KPTI exit trampoline only rewrites
+ * TTBR1. The cached copy in thread_info is updated too, because with software
+ * PAN __uaccess_ttbr0_enable() reloads TTBR0 from there.
+ */
+static void ttbr_write_ttbr0(struct mm_struct *source_mm, pgd_t *view_pgd)
+{
+	unsigned long asid = ASID(source_mm);
+	unsigned long ttbr0 = phys_to_ttbr(__pa(view_pgd));
+
+	if (system_supports_cnp() && asid)
+		ttbr0 |= TTBR_CNP_BIT;
+#ifdef CONFIG_ARM64_SW_TTBR0_PAN
+	ttbr0 |= ((u64)asid << 48);
+	WRITE_ONCE(task_thread_info(current)->ttbr0, ttbr0);
+#endif
+	write_sysreg(ttbr0, ttbr0_el1);
 	isb();
 }
 
+static void ttbr_install_view(struct mm_struct *source_mm, pgd_t *view_pgd)
+{
+	phys_addr_t pgd_phys;
+	unsigned long installed = this_cpu_read(ttbr_active_pgd);
+
+	if (!view_pgd) {
+		/* This CPU is not running the split's mm: forget the marker and
+		 * drop stale entries if an alter view was live here before. */
+		if (installed) {
+			ttbr_flush_local_asid(source_mm);
+			this_cpu_write(ttbr_active_pgd, 0);
+		}
+		return;
+	}
+
+	pgd_phys = __pa(view_pgd);
+	if (installed != (unsigned long)pgd_phys) {
+		ttbr_flush_local_asid(source_mm);
+		this_cpu_write(ttbr_active_pgd, (unsigned long)pgd_phys);
+	}
+	ttbr_write_ttbr0(source_mm, view_pgd);
+}
+
+/* Run on every CPU while a split goes away: forget the marker, drop the
+ * stale ASID entries and put any task that was using the alter view back on
+ * its own page table. No check_and_switch_context() here: it allocates ASIDs
+ * and takes locks, which is exactly what made the old implementation unsafe. */
 static void ttbr_force_source(void *data)
 {
 	struct lk1337_ttbr_split *split = data;
 
-	if (this_cpu_read(ttbr_active_split) != split)
+	this_cpu_write(ttbr_active_pgd, 0);
+	ttbr_flush_local_asid(split->source_mm);
+	if (current->mm != split->source_mm)
 		return;
-	ttbr_call_check_context(split->source_mm);
-	if (current->mm)
-		ttbr_update_saved_ttbr0(current, split->source_mm);
-	this_cpu_write(ttbr_active_split, NULL);
+	/*
+	 * Restore what this task is supposed to see once the split is gone.  In
+	 * the default mode that is the source view for everyone; in
+	 * executor-alter mode the executor is the exception, because after the
+	 * split is gone nothing else would put it back on the alter view.
+	 */
+	if (split->executor_alter &&
+	    task_pid_vnr(current) == split->executor_tid)
+		ttbr_write_ttbr0(split->source_mm, split->alter_pgd);
+	else
+		ttbr_write_ttbr0(split->source_mm, split->source_mm->pgd);
 }
+
+static void ttbr_probes_disarm(void);
+static void ttbr_probes_arm(void);
 
 static void ttbr_release_split(struct lk1337_ttbr_split *split)
 {
 	on_each_cpu(ttbr_force_source, split, 1);
 	wait_event(split->switch_wait, refcount_read(&split->switch_refs) == 1);
-	ttbr_clear_alter_ptes(split);
-	ttbr_sync_mm(split->alter_mm);
+	ttbr_sync_mm(split);
+	ttbr_free_alter_tables(split);
 	ttbr_free_pages(split->alter_pages, split->nr_pages);
 	ttbr_free_pages(split->real_pages, split->nr_pages);
-	mmput(split->alter_mm);
-	mmput(split->source_mm);
+	mmdrop(split->source_mm);
 	kvfree(split->alter_phys);
 	kvfree(split->real_phys);
 	kfree(split);
@@ -408,7 +531,6 @@ static void ttbr_destroy_split(struct lk1337_session *session,
 				       struct lk1337_ttbr_split *split)
 {
 	unsigned long flags;
-
 	mutex_lock(&ttbr_global_lock);
 	raw_spin_lock_irqsave(&ttbr_split_lock, flags);
 	if (split->active) {
@@ -416,62 +538,94 @@ static void ttbr_destroy_split(struct lk1337_session *session,
 		list_del_init(&split->global_node);
 	}
 	raw_spin_unlock_irqrestore(&ttbr_split_lock, flags);
+	/*
+	 * Withdraw the split from the lock-free fast path and wait for every
+	 * in-flight reader to finish before anything is freed.  A reader that
+	 * already loaded the pointer may still dereference it; synchronize_rcu()
+	 * gives it until the next grace period.
+	 */
+	if (rcu_access_pointer(ttbr_active_split) == split)
+		rcu_assign_pointer(ttbr_active_split, NULL);
 	mutex_unlock(&ttbr_global_lock);
+	synchronize_rcu();
 	list_del_init(&split->session_node);
+	/*
+	 * Drop the hooks before the split is freed.  The refcount guarantees the
+	 * last destroy (from LK1337_TTBR_DESTROY, a session close or module
+	 * unload) removes them, so an idle module leaves the scheduler alone.
+	 */
+	ttbr_probes_disarm();
 	ttbr_release_split(split);
 }
 
-static int ttbr_finish_task_switch(struct kprobe *probe, struct pt_regs *regs)
+/*
+ * finish_task_switch() is static and called exactly once, so ThinLTO may
+ * inline its only call site: the symbol still exists in kallsyms and accepts a
+ * kprobe, but the standalone body is never executed and the probe never fires.
+ * __schedule() is the common out-of-line path for every switch (voluntary,
+ * preemptive and idle), so the view is installed from its post-handler, which
+ * runs with current == the scheduled-in task.
+ */
+static void ttbr_schedule_post(struct kprobe *probe, struct pt_regs *regs,
+			       unsigned long flags)
 {
-	/* This kprobe executes while scheduler rq locks are held. Calling
-	 * check_and_switch_context() here is unsafe on GKI and can deadlock the
-	 * reader thread. Real TTBR selection must be wired into arch context_switch
-	 * or an exported vendor scheduler hook. */
-	return 0;
-#if 0
 	struct lk1337_ttbr_split *split;
-	struct lk1337_ttbr_split *found = NULL;
-	struct mm_struct *target = current->mm ? current->mm : current->active_mm;
-	unsigned long flags;
-	bool reader = false;
+	struct mm_struct *mm = current->mm;
+	pgd_t *view = NULL;
 
-	raw_spin_lock_irqsave(&ttbr_split_lock, flags);
-	list_for_each_entry(split, &ttbr_splits, global_node) {
-		if (!split->active || split->source_mm != current->mm)
-			continue;
-		if (!refcount_inc_not_zero(&split->switch_refs))
-			continue;
-		found = split;
-	if (task_pid_vnr(current) != split->executor_tid) {
-		target = split->alter_mm;
-		reader = true;
+	if (!mm)
+		return;
+
+	/*
+	 * Lock-free: no spinlock, no list walk.  The published pointer is only
+	 * written from process context and readers are protected by RCU, so this
+	 * is a couple of loads in the common case (no split, or the split's
+	 * executor).  This runs on every context switch in the system, so it has
+	 * to stay this cheap.
+	 */
+	rcu_read_lock();
+	split = rcu_dereference(ttbr_active_split);
+	if (split && split->active && split->source_mm == mm) {
+		bool is_executor = task_pid_vnr(current) == split->executor_tid;
+
+		/*
+		 * Default: the executor keeps the original view, every other
+		 * thread sees the alter view.  With LK1337_TTBR_F_EXECUTOR_ALTER
+		 * the mapping is inverted: the executor is the thread that sees
+		 * the alter view.
+		 */
+		if (is_executor == split->executor_alter)
+			view = split->alter_pgd;
+		else
+			view = mm->pgd;
 	}
-	if (reader && atomic_inc_return(&ttbr_switch_debug) <= 16)
-		pr_info("reader switch tid=%d source=%px alter=%px target=%px\n",
-			task_pid_vnr(current), split->source_mm, split->alter_mm, target);
-		break;
-	}
-	raw_spin_unlock_irqrestore(&ttbr_split_lock, flags);
-	ttbr_call_check_context(target);
-	if (current->mm)
-		ttbr_update_saved_ttbr0(current, target);
-	this_cpu_write(ttbr_active_split,
-			(unsigned long)(reader ? found : NULL));
-	if (found)
-		ttbr_switch_ref_put(found);
-	return 0;
-#endif
+	rcu_read_unlock();
+
+	ttbr_install_view(mm, view);
 }
+
+static struct lk1337_probe ttbr_schedule_probe =
+	LK1337_PROBE("__schedule", "ttbr", NULL, ttbr_schedule_post);
 
 static int ttbr_do_exit(struct kprobe *probe, struct pt_regs *regs)
 {
 	struct lk1337_ttbr_split *split;
 	unsigned long flags;
 
+	/*
+	 * Only the executor is supposed to see the source view; with it gone
+	 * every thread of the process would start seeing the alter view, which
+	 * is a snapshot of the address space and would soon crash the program.
+	 * Retire the split instead and leave the process on its own page table.
+	 */
 	raw_spin_lock_irqsave(&ttbr_split_lock, flags);
-	list_for_each_entry(split, &ttbr_splits, global_node)
-		if (split->source_mm == current->mm && split->executor_tid == task_pid_vnr(current))
-			split->executor_tid = 0;
+	list_for_each_entry(split, &ttbr_splits, global_node) {
+		if (split->active && split->source_mm == current->mm &&
+		    split->executor_tid == task_pid_vnr(current)) {
+			split->active = false;
+			list_del_init(&split->global_node);
+		}
+	}
 	raw_spin_unlock_irqrestore(&ttbr_split_lock, flags);
 	return 0;
 }
@@ -487,6 +641,43 @@ static int ttbr_begin_exec(struct kprobe *probe, struct pt_regs *regs)
 			split->executor_tid = 0;
 	raw_spin_unlock_irqrestore(&ttbr_split_lock, flags);
 	return 0;
+}
+
+/*
+ * The three TTBR hooks are refcounted together: the view is only selected by
+ * the __schedule post-handler while at least one split exists, so with no split
+ * configured the module does not touch the scheduler at all.
+ */
+static struct lk1337_probe ttbr_exit_probe =
+	LK1337_PROBE("do_exit", "ttbr", ttbr_do_exit, NULL);
+static struct lk1337_probe ttbr_exec_probe =
+	LK1337_PROBE("begin_new_exec", "ttbr", ttbr_begin_exec, NULL);
+static unsigned int ttbr_probe_refs;
+static DEFINE_MUTEX(ttbr_probe_lock);
+
+static void ttbr_probes_arm(void)
+{
+	mutex_lock(&ttbr_probe_lock);
+	if (ttbr_probe_refs++ == 0) {
+		if (lk1337_probe_use(&ttbr_schedule_probe))
+			pr_warn("ttbr: __schedule hook unavailable, views will not switch\n");
+		if (lk1337_probe_use(&ttbr_exit_probe))
+			pr_warn("ttbr: do_exit hook unavailable, splits may outlive their executor\n");
+		if (lk1337_probe_use(&ttbr_exec_probe))
+			pr_warn("ttbr: begin_new_exec hook unavailable\n");
+	}
+	mutex_unlock(&ttbr_probe_lock);
+}
+
+static void ttbr_probes_disarm(void)
+{
+	mutex_lock(&ttbr_probe_lock);
+	if (ttbr_probe_refs && --ttbr_probe_refs == 0) {
+		lk1337_probe_release(&ttbr_exec_probe);
+		lk1337_probe_release(&ttbr_exit_probe);
+		lk1337_probe_release(&ttbr_schedule_probe);
+	}
+	mutex_unlock(&ttbr_probe_lock);
 }
 
 static int ttbr_set_executor(struct lk1337_ttbr_split *split, pid_t tid)
@@ -524,65 +715,34 @@ int lk1337_ttbr_init(void)
 	int ret;
 
 	ttbr_resolve_kallsyms();
-	ret = ttbr_resolve(&ttbr_dup_mm, "dup_mm");
-	if (ret) {
-		pr_warn("resolve dup_mm failed: %d (kallsyms=%s); trying mm_alloc/dup_mmap\n",
-			ret, ttbr_kallsyms_lookup_name ? "available" : "unavailable");
-		ttbr_dup_mm = NULL;
-	}
-	if (!ttbr_dup_mm) {
-		if (ttbr_resolve(&ttbr_mm_alloc, "mm_alloc") ||
-		    ttbr_resolve(&ttbr_dup_mmap, "dup_mmap"))
-			pr_warn("mm_alloc/dup_mmap fallback unavailable\n");
-		else
-			pr_info("using mm_alloc/dup_mmap address-space clone fallback\n");
-	}
-	ret = ttbr_resolve(&ttbr_check_context, "check_and_switch_context");
-	if (ret) {
-		pr_err("resolve check_and_switch_context failed: %d\n", ret);
-		return ret;
-	}
+	/* check_and_switch_context() is deliberately NOT used: the view switch
+	 * is a thread_info->ttbr0 store, which avoids its ASID allocation and
+	 * locking entirely. */
 	ret = ttbr_resolve(&ttbr_get_locked_pte, "__get_locked_pte");
 	if (ret) {
 		pr_err("resolve __get_locked_pte failed: %d\n", ret);
 		return ret;
 	}
-	ttbr_exit_kp.symbol_name = "do_exit";
-	ttbr_exit_kp.pre_handler = ttbr_do_exit;
-	ret = register_kprobe(&ttbr_exit_kp);
-	if (ret) {
-		pr_warn("register do_exit kprobe failed: %d\n", ret);
-	} else {
-		ttbr_exit_registered = true;
-	}
-	ttbr_switch_kp.symbol_name = "finish_task_switch";
-	ttbr_switch_kp.pre_handler = ttbr_finish_task_switch;
-	ret = register_kprobe(&ttbr_switch_kp);
-	if (ret) {
-		pr_warn("register finish_task_switch kprobe failed: %d\n", ret);
-	} else {
-		ttbr_switch_registered = true;
-	}
-	ttbr_exec_kp.symbol_name = "begin_new_exec";
-	ttbr_exec_kp.pre_handler = ttbr_begin_exec;
-	ret = register_kprobe(&ttbr_exec_kp);
-	if (ret) {
-		pr_warn("register begin_new_exec kprobe failed: %d\n", ret);
-	} else {
-		ttbr_exec_registered = true;
-	}
-	pr_info("initialized source/alter per-thread TTBR views\n");
+	/*
+	 * No probe is registered here.  The __schedule/do_exit/begin_new_exec
+	 * hooks are installed by the first LK1337_TTBR_SETUP and removed again
+	 * when the last view is destroyed, so an idle module costs nothing on
+	 * the scheduler.
+	 */
+	pr_info("per-thread TTBR views ready (hooks installed on demand)\n");
 	return 0;
 }
 
 void lk1337_ttbr_exit(void)
 {
-	if (ttbr_exec_registered)
-		unregister_kprobe(&ttbr_exec_kp);
-	if (ttbr_switch_registered)
-		unregister_kprobe(&ttbr_switch_kp);
-	if (ttbr_exit_registered)
-		unregister_kprobe(&ttbr_exit_kp);
+	mutex_lock(&ttbr_probe_lock);
+	if (ttbr_probe_refs) {
+		ttbr_probe_refs = 0;
+		lk1337_probe_release(&ttbr_exec_probe);
+		lk1337_probe_release(&ttbr_exit_probe);
+		lk1337_probe_release(&ttbr_schedule_probe);
+	}
+	mutex_unlock(&ttbr_probe_lock);
 }
 
 void lk1337_ttbr_session_release(struct lk1337_session *session)
@@ -611,10 +771,11 @@ long lk1337_ttbr_dispatch(struct lk1337_session *session, unsigned int cmd,
 
 	switch (cmd) {
 	case LK1337_TTBR_SETUP:
-		return -EOPNOTSUPP;
 		if (copy_from_user(&setup, arg, sizeof(setup)))
 			return -EFAULT;
-		if (setup.flags || setup.executor_tid <= 0 ||
+		if ((setup.flags & LK1337_TTBR_F_EXECUTOR_ALTER) ||
+		    (setup.flags & ~LK1337_TTBR_F_EXECUTOR_SOURCE) ||
+		    setup.executor_tid <= 0 ||
 		    !ttbr_valid_range(setup.start, setup.end, &nr_pages) ||
 		    !setup.alter_mem || setup.source_pid < 0)
 			return -EINVAL;
@@ -630,6 +791,22 @@ long lk1337_ttbr_dispatch(struct lk1337_session *session, unsigned int cmd,
 		if (!source_mm) {
 			put_task_struct(source_task);
 			return -EINVAL;
+		}
+		/* The executor selects the view by tid, so it has to be a thread
+		 * of the same address space. */
+		{
+			struct pid *epid = find_get_pid(setup.executor_tid);
+			struct task_struct *etask = epid ?
+				get_pid_task(epid, PIDTYPE_PID) : NULL;
+
+			put_pid(epid);
+			if (!etask || etask->mm != source_mm) {
+				put_task_struct(etask);
+				mmput(source_mm);
+				put_task_struct(source_task);
+				return etask ? -EXDEV : -ESRCH;
+			}
+			put_task_struct(etask);
 		}
 		mutex_lock(&ttbr_global_lock);
 		list_for_each_entry(other, &ttbr_splits, global_node)
@@ -648,16 +825,8 @@ long lk1337_ttbr_dispatch(struct lk1337_session *session, unsigned int cmd,
 			ret = -ENOMEM;
 			goto setup_fail;
 		}
-		for (i = 0; i < nr_pages; ++i) {
-			ret = ttbr_lookup_source_page(source_mm,
-						      setup.start + ((unsigned long)i << PAGE_SHIFT),
-						      &real_pages[i]);
-			if (ret)
-				goto setup_fail;
-			real_phys[i] = page_to_phys(real_pages[i]);
-		}
 		ret = ttbr_alloc_alter_pages(alter_pages, nr_pages,
-						     u64_to_user_ptr(setup.alter_mem));
+					     u64_to_user_ptr(setup.alter_mem));
 		if (ret)
 			goto setup_fail;
 		split = kzalloc(sizeof(*split), GFP_KERNEL);
@@ -673,6 +842,9 @@ long lk1337_ttbr_dispatch(struct lk1337_session *session, unsigned int cmd,
 		split->executor_tid = setup.executor_tid;
 		split->start = setup.start;
 		split->end = setup.end;
+		/* Default is executor-alter; the flag asks for the old direction. */
+		split->executor_alter =
+			!(setup.flags & LK1337_TTBR_F_EXECUTOR_SOURCE);
 		split->nr_pages = nr_pages;
 		split->real_pages = real_pages;
 		split->alter_pages = alter_pages;
@@ -682,21 +854,26 @@ long lk1337_ttbr_dispatch(struct lk1337_session *session, unsigned int cmd,
 		split->active = true;
 		INIT_LIST_HEAD(&split->session_node);
 		INIT_LIST_HEAD(&split->global_node);
-		split->alter_mm = ttbr_clone_mm(source_task, source_mm);
-		if (!split->alter_mm) {
-			ret = -ENOMEM;
-			goto setup_fail;
-		}
-		ret = ttbr_prepare_ptes(split->alter_mm, split->start, split->nr_pages);
-		if (ret) {
-			mmput(split->alter_mm);
-			split->alter_mm = NULL;
-			goto setup_fail;
-		}
 		for (i = 0; i < nr_pages; ++i)
 			alter_phys[i] = page_to_phys(alter_pages[i]);
-		ttbr_set_alter_ptes(split, alter_pages);
-		ttbr_sync_mm(split->alter_mm);
+		/* Keep the source address space stable while both the real-page walk
+		 * and the private table clone inspect its page tables.  The user copy
+		 * above is deliberately completed before taking this lock so a fault in
+		 * the caller's alter buffer cannot recurse through mmap_lock. */
+		mmap_read_lock(source_mm);
+		for (i = 0; i < nr_pages; ++i) {
+			ret = ttbr_lookup_source_page(source_mm,
+						      setup.start + ((unsigned long)i << PAGE_SHIFT),
+						      &real_pages[i]);
+			if (ret)
+				break;
+			real_phys[i] = page_to_phys(real_pages[i]);
+		}
+		if (!ret)
+			ret = ttbr_build_alter_tables(split);
+		mmap_read_unlock(source_mm);
+		if (ret)
+			goto setup_fail;
 		mutex_lock(&ttbr_global_lock);
 		list_for_each_entry(other, &ttbr_splits, global_node)
 			if (other->source_mm == source_mm) {
@@ -706,7 +883,15 @@ long lk1337_ttbr_dispatch(struct lk1337_session *session, unsigned int cmd,
 			}
 		list_add_tail(&split->global_node, &ttbr_splits);
 		list_add_tail(&split->session_node, &session->ttbr_views);
+		/* Publish for the lock-free per-switch path. */
+		rcu_assign_pointer(ttbr_active_split, split);
 		mutex_unlock(&ttbr_global_lock);
+		/* First live split: install the scheduler/exit hooks. */
+		ttbr_probes_arm();
+		/* Keep the mm_struct alive without keeping mm_users, so the
+		 * process can still exit and run exit_mmap() normally. */
+		mmgrab(source_mm);
+		mmput(source_mm);
 		put_task_struct(source_task);
 		setup.view_id = split->id;
 		if (copy_to_user(arg, &setup, sizeof(setup))) {
@@ -716,8 +901,7 @@ long lk1337_ttbr_dispatch(struct lk1337_session *session, unsigned int cmd,
 		return 0;
 	setup_fail:
 		if (split) {
-			if (split->alter_mm)
-				mmput(split->alter_mm);
+			ttbr_free_alter_tables(split);
 			kfree(split);
 		}
 		ttbr_free_pages(alter_pages, nr_pages);
@@ -744,19 +928,16 @@ long lk1337_ttbr_dispatch(struct lk1337_session *session, unsigned int cmd,
 			return ret;
 		}
 		mutex_lock(&split->lock);
-		ret = ttbr_prepare_ptes(split->alter_mm, split->start, split->nr_pages);
-		if (!ret) {
-			ttbr_set_alter_ptes(split, alter_pages);
-			ttbr_sync_mm(split->alter_mm);
-			{
-				struct page **old = split->alter_pages;
-				split->alter_pages = alter_pages;
-				for (i = 0; i < split->nr_pages; ++i)
-					split->alter_phys[i] = page_to_phys(alter_pages[i]);
-				ttbr_free_pages(old, split->nr_pages);
-			}
-		} else {
-			ttbr_free_pages(alter_pages, split->nr_pages);
+		ttbr_set_alter_ptes(split, alter_pages);
+		ttbr_sync_mm(split);
+		{
+			struct page **old = split->alter_pages;
+
+			split->alter_pages = alter_pages;
+			for (i = 0; i < split->nr_pages; ++i)
+				split->alter_phys[i] = page_to_phys(alter_pages[i]);
+			ttbr_free_pages(old, split->nr_pages);
+			alter_pages = NULL;
 		}
 		mutex_unlock(&split->lock);
 		return ret;
@@ -792,14 +973,16 @@ long lk1337_ttbr_dispatch(struct lk1337_session *session, unsigned int cmd,
 		mutex_lock(&split->lock);
 		query.source_pid = split->source_pid;
 		query.executor_tid = split->executor_tid;
+		query.flags = split->executor_alter ? 0 : LK1337_TTBR_F_EXECUTOR_SOURCE;
 		query.start = split->start;
 		query.end = split->end;
 		query.size = split->end - split->start;
 		query.nr_pages = split->nr_pages;
 		query.source_pgd_phys = __pa(split->source_mm->pgd);
-		query.alter_pgd_phys = __pa(split->alter_mm->pgd);
+		query.alter_pgd_phys = __pa(split->alter_pgd);
 		query.source_asid = atomic64_read(&split->source_mm->context.id);
-		query.alter_asid = atomic64_read(&split->alter_mm->context.id);
+		/* both views are walked with the source mm's ASID by design */
+		query.alter_asid = ASID(split->source_mm);
 		query.page_count = split->nr_pages;
 		if (query.page_capacity && query.page_capacity < split->nr_pages) {
 			mutex_unlock(&split->lock);
