@@ -1,0 +1,26 @@
+# 内核模块构建产物（本地 make / build-module.sh 生成，不入库）
+*.o
+*.ko
+*.mod
+*.mod.c
+*.lto.o
+*.lds
+*.tmp.ko
+.*.cmd
+.*.d
+Module.symvers
+modules.order
+modules.builtin
+modules.builtin.modinfo
+
+# kbuild 的 ThinLTO 缓存与临时文件
+.thinlto-cache/
+.tmp_*
+
+# 用户态工具与设备测试工件：只保留在本地，不入库
+prochide/
+mwtest/
+.work/
+
+# bench 的 arm64 用户态工具（源码入库，二进制不入库）
+bench/*-arm64

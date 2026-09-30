@@ -11,10 +11,15 @@
 #include <linux/kprobes.h>
 #include <linux/anon_inodes.h>
 #include <linux/task_work.h>
+#include <linux/version.h>
 #include <linux/vmalloc.h>
 #include <linux/rcupdate.h>
 #include <linux/sched/signal.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+#include <linux/unaligned.h>
+#else
 #include <asm/unaligned.h>
+#endif
 
 /*
  * The probe manager's own implementation (mutex, state, register/unregister
@@ -427,7 +432,7 @@ static void lk1337_bootstrap_workfn(struct callback_head *callback)
 fail:
 	{
 		int error = -ENOMEM;
-		copy_to_user(&work->request->fd, &error, sizeof(error));
+		(void)copy_to_user(&work->request->fd, &error, sizeof(error));
 	}
 out:
 	kfree(work);
@@ -789,7 +794,7 @@ static const struct file_operations lk1337_fops = {
 	.owner = THIS_MODULE,
 	.release = lk1337_release,
 	.unlocked_ioctl = lk1337_ioctl,
-	.llseek = no_llseek,
+	.llseek = NULL,
 };
 
 static int __init lk1337_init(void)

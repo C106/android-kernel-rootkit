@@ -69,6 +69,7 @@
 #include <asm/memory.h>
 #include <asm/pgtable.h>
 #include <asm/tlbflush.h>
+#include "kcompat.h"
 
 #include "probe_mgr.h"
 
@@ -80,7 +81,7 @@ static void lk1337_uxn_drop_hooks_workfn(struct callback_head *callback);
 
 /* Mirror of arch/arm64/mm/fault.c:struct fault_info. */
 struct lk1337_fault_info {
-	int (*fn)(unsigned long far, unsigned int esr, struct pt_regs *regs);
+	int (*fn)(unsigned long far, LK1337_FAULT_ESR_T esr, struct pt_regs *regs);
 	int sig;
 	int code;
 	const char *name;
@@ -116,8 +117,8 @@ static DEFINE_RAW_SPINLOCK(lk1337_uxn_lock);
 
 /* fault_info[] replacement state. */
 static struct lk1337_fault_info *lk1337_uxn_fault_info;
-static int (*lk1337_uxn_orig[LK1337_UXN_FSC_MAX])(unsigned long, unsigned int,
-						   struct pt_regs *);
+static int (*lk1337_uxn_orig[LK1337_UXN_FSC_MAX])(unsigned long, LK1337_FAULT_ESR_T,
+							struct pt_regs *);
 static unsigned int lk1337_uxn_slots[LK1337_UXN_FSC_MAX];
 static unsigned int lk1337_uxn_nslots;
 static bool lk1337_uxn_faults_hooked;
@@ -137,7 +138,7 @@ typedef int (*lk1337_uxn_task_work_add_t)(struct task_struct *,
 					  enum task_work_notify_mode);
 static lk1337_uxn_task_work_add_t lk1337_uxn_task_work_add;
 
-static int lk1337_uxn_fault(unsigned long far, unsigned int esr,
+static int lk1337_uxn_fault(unsigned long far, LK1337_FAULT_ESR_T esr,
 			    struct pt_regs *regs);
 static void *lk1337_uxn_symbol(const char *name);
 static void lk1337_uxn_restore_workfn(struct callback_head *callback);
@@ -190,9 +191,9 @@ static __nocfi void lk1337_uxn_call_set_fixmap(enum fixed_addresses idx,
 	lk1337_uxn_set_fixmap(idx, phys, prot);
 }
 
-static __nocfi int lk1337_uxn_call_orig(int (*orig)(unsigned long, unsigned int,
-						    struct pt_regs *),
-					unsigned long far, unsigned int esr,
+static __nocfi int lk1337_uxn_call_orig(int (*orig)(unsigned long,
+							LK1337_FAULT_ESR_T, struct pt_regs *),
+					unsigned long far, LK1337_FAULT_ESR_T esr,
 					struct pt_regs *regs)
 {
 	return orig(far, esr, regs);
@@ -293,7 +294,7 @@ static int lk1337_uxn_hook_faults(void)
 
 	for (i = 0; i < ARRAY_SIZE(lk1337_uxn_perm_slots); i++) {
 		unsigned int slot = lk1337_uxn_perm_slots[i];
-		int (*fn)(unsigned long, unsigned int, struct pt_regs *) =
+		int (*fn)(unsigned long, LK1337_FAULT_ESR_T, struct pt_regs *) =
 			READ_ONCE(lk1337_uxn_fault_info[slot].fn);
 
 		if (!fn) {
@@ -359,11 +360,11 @@ static void lk1337_uxn_unhook_faults(void)
  * struct fault_info::fn exactly for the kernel's CFI check to accept it.
  * __CFI_ADDRESSABLE guarantees the module's jump table carries it.
  */
-static int lk1337_uxn_fault(unsigned long far, unsigned int esr,
+static int lk1337_uxn_fault(unsigned long far, LK1337_FAULT_ESR_T esr,
 			    struct pt_regs *regs)
 {
 	unsigned int fsc = esr & ESR_ELx_FSC;
-	int (*orig)(unsigned long, unsigned int, struct pt_regs *);
+	int (*orig)(unsigned long, LK1337_FAULT_ESR_T, struct pt_regs *);
 	struct lk1337_uxn_page *page;
 	struct lk1337_uxn_ref *ref;
 	struct lk1337_breakpoint *bp = NULL;
@@ -452,7 +453,7 @@ static int lk1337_uxn_fault(unsigned long far, unsigned int esr,
 	return 0;
 }
 
-__CFI_ADDRESSABLE(lk1337_uxn_fault);
+LK1337_CFI_ADDRESSABLE(lk1337_uxn_fault);
 
 /* ------------------------------------------------------------------ */
 /* PTE / block PMD manipulation                                        */
@@ -535,7 +536,7 @@ static int lk1337_uxn_protect(struct mm_struct *mm, unsigned long addr, bool nx,
 		spin_unlock(ptl);
 		/* flush_tlb_page() invalidates only the last level; a block
 		 * entry needs an all-levels, ASID-wide invalidation. */
-		flush_tlb_mm(mm);
+		LK1337_UXN_FLUSH_TLB_MM(mm);
 		goto out;
 	}
 	if (pmd_none(middle) || pmd_bad(middle) || !pmd_present(middle)) {
@@ -558,7 +559,7 @@ static int lk1337_uxn_protect(struct mm_struct *mm, unsigned long addr, bool nx,
 	if (pte_val(updated) != pte_val(entry))
 		set_pte(ptep, updated);
 	pte_unmap_unlock(ptep, ptl);
-	flush_tlb_page(vma, addr);
+	LK1337_UXN_FLUSH_TLB_PAGE(vma, addr);
 	goto out;
 
 unlock:
@@ -657,7 +658,7 @@ static void lk1337_uxn_rearm_workfn(struct callback_head *callback)
  * rewinds the step; the mapping is re-armed from a task_work callback because
  * this hook runs with preemption disabled.
  */
-static int lk1337_uxn_step_fn(struct pt_regs *regs, unsigned int esr)
+static int lk1337_uxn_step_fn(struct pt_regs *regs, LK1337_STEP_ESR_T esr)
 {
 	struct lk1337_uxn_page *page;
 	struct lk1337_uxn_rearm *work;
@@ -1046,8 +1047,9 @@ static int lk1337_uxn_create_bp(struct lk1337_session *session,
 	list_add_tail(&bp->node, &session->breakpoints);
 	request->bp_id = bp->id;
 	mmput(mm);
-	pr_info("UXN breakpoint id=%d addr=%lx pid=%d flags=0x%x granule=%s\n",
-		bp->id, request->addr, request->pid, request->flags,
+	pr_info("UXN breakpoint id=%d addr=%llx pid=%d flags=0x%x granule=%s\n",
+		bp->id, (unsigned long long)request->addr,
+		request->pid, request->flags,
 		shift == PMD_SHIFT ? "2M" : "4K");
 	return 0;
 

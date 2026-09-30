@@ -4,6 +4,7 @@
 #include <linux/dcache.h>
 #include <linux/fs.h>
 #include <linux/sched/mm.h>
+#include "kcompat.h"
 
 static int lk1337_module_base(struct lk1337_base *request)
 {
@@ -41,7 +42,9 @@ static int lk1337_module_base(struct lk1337_base *request)
 	}
 	request->base = 0;
 	mmap_read_lock(mm);
-	for (vma = mm->mmap; vma; vma = vma->vm_next) {
+	{
+		LK1337_VMA_ITER(vmi, mm, 0);
+		LK1337_FOR_EACH_VMA(vmi, vma) {
 		if (!vma->vm_file)
 			continue;
 		resolved = d_path(&vma->vm_file->f_path, path, PATH_MAX);
@@ -49,6 +52,7 @@ static int lk1337_module_base(struct lk1337_base *request)
 			request->base = vma->vm_start;
 			error = 0;
 			break;
+		}
 		}
 	}
 	mmap_read_unlock(mm);

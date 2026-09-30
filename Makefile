@@ -9,7 +9,32 @@ OUT ?= $(KDIR)/out
 ARCH ?= arm64
 JOBS ?= 16
 MODULE_DIR := $(CURDIR)
-ccflags-y += -I$(KDIR)/fs/proc
+ccflags-y += -I$(srctree)/fs/proc
+# The ioctl dispatcher carries several UAPI snapshots on the stack.  GKI 6.x
+# enables -Wframe-larger-than=1024 as an error; keep the existing layout while
+# allowing this dispatcher to be checked at the module boundary.
+ccflags-y += -Wno-frame-larger-than=
+
+# Probe the target kernel instead of relying on Android release names: some
+# GKI branches share the same LINUX_VERSION_CODE but differ in ABI and exports.
+ifneq ($(KERNELRELEASE),)
+ifneq ($(shell sed -n '/^struct fault_info {/,/^};/p' $(srctree)/arch/arm64/mm/fault.c | grep -Fq 'unsigned long esr' && echo y),)
+ccflags-y += -DLK1337_FAULT_ESR_ULONG
+endif
+ifneq ($(shell sed -n '/^struct step_hook {/,/^};/p' $(srctree)/arch/arm64/include/asm/debug-monitors.h | grep -Fq 'unsigned long esr' && echo y),)
+ccflags-y += -DLK1337_STEP_ESR_ULONG
+endif
+ifneq ($(shell grep -Fq orig_overflow_handler $(srctree)/include/linux/perf_event.h && echo y),)
+ccflags-y += -DLK1337_HAS_PERF_ORIG_OVERFLOW
+endif
+ifneq ($(shell awk '$$2 == "swp_swap_info" { print "y"; exit }' $(objtree)/Module.symvers 2>/dev/null),)
+ccflags-y += -DLK1337_HAS_SWP_SWAP_INFO
+endif
+ifneq ($(shell grep -Fq thread_get_sve_vl $(srctree)/arch/arm64/include/asm/processor.h && echo y),)
+ccflags-y += -DLK1337_HAS_THREAD_SVE_VL
+asflags-y += -DLK1337_HAS_THREAD_SVE_VL
+endif
+endif
 
 CLANG_PREBUILT ?= $(KDIR)/../prebuilts/clang/host/linux-x86/clang-r416183b
 LLVM ?= 1

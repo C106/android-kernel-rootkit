@@ -13,6 +13,7 @@
 #include <linux/slab.h>
 #include <linux/smp.h>
 #include <linux/uaccess.h>
+#include <linux/version.h>
 #include <linux/wait.h>
 #include <asm/cacheflush.h>
 #include <asm/mmu.h>
@@ -25,6 +26,23 @@
 #include "debugger_uapi.h"
 #include "probe_mgr.h"
 #include "ttbr_view.h"
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+#define lk1337_pmd_ctor(page) pagetable_pmd_ctor(page_ptdesc(page))
+#define lk1337_pte_ctor(page) pagetable_pte_ctor(page_ptdesc(page))
+#define lk1337_pmd_dtor(page) pagetable_dtor(page_ptdesc(page))
+#define lk1337_pte_dtor(page) pagetable_dtor(page_ptdesc(page))
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#define lk1337_pmd_ctor(page) pagetable_pmd_ctor(page_ptdesc(page))
+#define lk1337_pte_ctor(page) pagetable_pte_ctor(page_ptdesc(page))
+#define lk1337_pmd_dtor(page) pagetable_pmd_dtor(page_ptdesc(page))
+#define lk1337_pte_dtor(page) pagetable_pte_dtor(page_ptdesc(page))
+#else
+#define lk1337_pmd_ctor(page) pgtable_pmd_page_ctor(page)
+#define lk1337_pte_ctor(page) pgtable_pte_page_ctor(page)
+#define lk1337_pmd_dtor(page) pgtable_pmd_page_dtor(page)
+#define lk1337_pte_dtor(page) pgtable_pte_page_dtor(page)
+#endif
 
 struct lk1337_session {
 	struct mutex lock;
@@ -334,8 +352,8 @@ static int ttbr_build_alter_tables(struct lk1337_ttbr_split *split)
 	split->alter_pte = (pte_t *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
 	if (!split->alter_pgd || !split->alter_pmd || !split->alter_pte)
 		return -ENOMEM;
-	if (!pgtable_pmd_page_ctor(virt_to_page(split->alter_pmd)) ||
-	    !pgtable_pte_page_ctor(virt_to_page(split->alter_pte)))
+	if (!lk1337_pmd_ctor(virt_to_page(split->alter_pmd)) ||
+	    !lk1337_pte_ctor(virt_to_page(split->alter_pte)))
 		return -ENOMEM;
 
 	memcpy(split->alter_pgd, src->pgd, PAGE_SIZE);
@@ -367,12 +385,12 @@ static int ttbr_build_alter_tables(struct lk1337_ttbr_split *split)
 static void ttbr_free_alter_tables(struct lk1337_ttbr_split *split)
 {
 	if (split->alter_pte) {
-		pgtable_pte_page_dtor(virt_to_page(split->alter_pte));
+		lk1337_pte_dtor(virt_to_page(split->alter_pte));
 		free_page((unsigned long)split->alter_pte);
 		split->alter_pte = NULL;
 	}
 	if (split->alter_pmd) {
-		pgtable_pmd_page_dtor(virt_to_page(split->alter_pmd));
+		lk1337_pmd_dtor(virt_to_page(split->alter_pmd));
 		free_page((unsigned long)split->alter_pmd);
 		split->alter_pmd = NULL;
 	}

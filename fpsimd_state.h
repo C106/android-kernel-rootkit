@@ -4,6 +4,7 @@
 #include <asm/fpsimd.h>
 #include <asm/simd.h>
 #include "debugger_uapi.h"
+#include "kcompat.h"
 
 void lk1337_fpsimd_save(struct user_fpsimd_state *state);
 void lk1337_fpsimd_load(struct user_fpsimd_state *state);
@@ -18,18 +19,22 @@ static bool lk1337_fp_capture(struct lk1337_snapshot *snapshot)
 	bool live = !test_thread_flag(TIF_FOREIGN_FPSTATE);
 	unsigned int index;
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+	if (!may_use_simd())
+#else
 	if (in_nmi() || in_irq() || __this_cpu_read(fpsimd_context_busy))
+#endif
 		return false;
 #ifdef CONFIG_ARM64_SVE
 	if (test_thread_flag(TIF_SVE)) {
-		if (!current->thread.sve_state || !current->thread.sve_vl)
+		if (!current->thread.sve_state || !LK1337_SVE_VL(current))
 			return false;
 		if (live)
 			lk1337_sve_save(sve_pffr(&current->thread), &state->fpsr);
 		for (index = 0; index < 32; index++)
 			memcpy(&snapshot->vregs[index],
 			       (char *)current->thread.sve_state +
-			       index * current->thread.sve_vl, 16);
+			       index * LK1337_SVE_VL(current), 16);
 	} else
 #endif
 	{
@@ -81,11 +86,11 @@ static __maybe_unused void lk1337_fp_apply(const struct lk1337_snapshot *snapsho
 	if (test_thread_flag(TIF_SVE)) {
 		for (index = 0; index < 32; index++)
 			memcpy((char *)current->thread.sve_state +
-			       index * current->thread.sve_vl,
+			       index * LK1337_SVE_VL(current),
 			       &snapshot->vregs[index], 16);
 		if (live)
 			lk1337_sve_load(sve_pffr(&current->thread), &state->fpsr,
-				    sve_vq_from_vl(current->thread.sve_vl) - 1);
+				    sve_vq_from_vl(LK1337_SVE_VL(current)) - 1);
 	} else
 #endif
 	if (live)

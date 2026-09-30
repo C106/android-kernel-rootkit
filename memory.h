@@ -12,6 +12,7 @@
 #include <linux/swapops.h>
 #include <asm/cacheflush.h>
 #include <asm/pgtable.h>
+#include "kcompat.h"
 
 /*
  * Read a swapped-out page straight from the swap device into a page of our
@@ -31,6 +32,7 @@
  */
 static struct page *lk1337_read_swap_page(swp_entry_t entry)
 {
+#ifdef LK1337_HAS_SWP_SWAP_INFO
 	struct swap_info_struct *si = swp_swap_info(entry);
 	struct bio *bio;
 	struct page *page;
@@ -46,7 +48,7 @@ static struct page *lk1337_read_swap_page(swp_entry_t entry)
 	page = alloc_page(GFP_KERNEL);
 	if (!page)
 		return NULL;
-	bio = bio_alloc(GFP_KERNEL, 1);
+	bio = lk1337_bio_alloc(si->bdev, GFP_KERNEL, 1);
 	if (!bio) {
 		__free_pages(page, 0);
 		return NULL;
@@ -65,6 +67,9 @@ fail:
 	bio_put(bio);
 	__free_pages(page, 0);
 	return NULL;
+#else
+	return NULL;
+#endif
 }
 
 static struct page *lk1337_resolve_page(struct mm_struct *mm, unsigned long addr,
