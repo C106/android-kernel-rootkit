@@ -8,11 +8,6 @@
 - 基于 perf 的线程硬件断点和观察点
 - 基于 PTE UXN 的执行断点
 - 命中记录、寄存器模板和 FPSIMD 状态处理
-- `/proc/<pid>/maps` 过滤
-- system_server 陀螺仪数据调整
-- 进程隐藏（memwatch）
-- TTBR 线程级内存视图切换
-- 按需注册和释放 kprobe
 
 具体命令号、结构体和 ABI 定义见 [debugger_uapi.h](debugger_uapi.h) 与 [memwatch_uapi.h](memwatch_uapi.h)。
 
@@ -59,9 +54,5 @@ rmmod lk1337
 | --- | --- |
 | `601`-`603` | 内存读写、映射基址查询 |
 | `610`-`618` | 硬件/UXN 断点及命中记录 |
-| `620` | 陀螺仪数据调整 |
-| `621`-`628` | maps 过滤配置 |
-| `630`-`635` | TTBR 内存视图 |
-| `641`-`645` | 进程隐藏 |
 
 接口参数以 UAPI 头文件为准。
